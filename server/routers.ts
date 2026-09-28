@@ -7,6 +7,7 @@ import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { budgets, expenses, followUps } from "../drizzle/schema";
 import { getCompanySnapshot, getDb, getOrCreateCompany, seedCompanyDemo } from "./db";
+import { getSupabaseClient, getSupabaseConfig } from "./supabase";
 
 const budgetInput = z.object({ period: z.string().regex(/^\d{4}-\d{2}$/), department: z.string().min(2).max(120), expenseCategory: z.string().min(2).max(120), estimatedAmount: z.number().positive(), notes: z.string().max(500).optional() });
 const expenseInput = z.object({ expenseDate: z.string().min(10), period: z.string().regex(/^\d{4}-\d{2}$/), department: z.string().min(2).max(120), expenseCategory: z.string().min(2).max(120), description: z.string().max(500).optional(), actualAmount: z.number().positive(), paymentMethod: z.string().min(2).max(60), supportingDocument: z.enum(["Available", "Pending Review"]).default("Available") });
@@ -25,6 +26,15 @@ export const appRouter = router({
   }),
   company: router({
     get: protectedProcedure.query(({ ctx }) => companyFor(ctx)),
+  }),
+  integrations: router({
+    supabaseStatus: protectedProcedure.query(async () => {
+      const config = getSupabaseConfig();
+      const client = getSupabaseClient();
+      if (!config || !client) return { connected: false, projectRef: null };
+      const { error } = await client.from("companies").select("id").limit(1);
+      return { connected: !error, projectRef: config.projectRef, error: error?.message ?? null };
+    }),
   }),
   dashboard: router({
     get: protectedProcedure.query(async ({ ctx }) => { const company = await companyFor(ctx); return getCompanySnapshot(company.id); }),
