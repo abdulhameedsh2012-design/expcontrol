@@ -2,10 +2,10 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 export function getSupabaseConfig() {
   const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_ANON_KEY;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_ANON_KEY;
   const projectRef = process.env.SUPABASE_PROJECT_REF;
   if (!url || !key || !projectRef) return null;
-  return { url, key, projectRef };
+  return { url, key, projectRef, isAdmin: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY) };
 }
 
 let client: SupabaseClient | null = null;
