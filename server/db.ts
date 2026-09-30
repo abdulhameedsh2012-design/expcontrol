@@ -4,6 +4,7 @@ import { InsertUser, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 import { classifyVariance } from "../shared/variance";
 import { getSupabaseClient } from "./supabase";
+import { recordAudit } from "./audit";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -39,7 +40,7 @@ export async function getUserByOpenId(openId: string) {
   return result[0];
 }
 
-type CompanyRow = { id: number; owner_id: number; name: string; currency: string; created_at: string; updated_at: string };
+type CompanyRow = { id: number; owner_id: number; app_user_id: number; name: string; currency: string; created_at: string; updated_at: string };
 type BudgetRow = { id: number; company_id: number; period: string; department: string; expense_category: string; estimated_amount: string | number; notes: string | null; created_at: string; updated_at: string };
 type ExpenseRow = { id: number; company_id: number; transaction_id: string; expense_date: string; period: string; department: string; expense_category: string; description: string | null; actual_amount: string | number; payment_method: string; supporting_document: "Available" | "Pending Review"; created_at: string };
 type FollowUpRow = { id: number; company_id: number; period: string; department: string; expense_category: string; estimated_amount: string | number; actual_amount: string | number; variance_amount: string | number; variance_percent: string | number; priority: "High" | "Medium" | "Low"; reason: string | null; recommended_action: string | null; status: "Open" | "In Progress" | "Closed"; created_at: string; updated_at: string };
@@ -54,7 +55,7 @@ const key = (period: string, dept: string, cat: string) => `${period}|${dept}|${
 const date = (value: string) => new Date(value.includes("T") ? value : `${value}T00:00:00Z`);
 
 function mapCompany(row: CompanyRow) {
-  return { id: Number(row.id), ownerId: Number(row.owner_id), name: row.name, currency: row.currency, createdAt: date(row.created_at), updatedAt: date(row.updated_at) };
+  return { id: Number(row.id), ownerId: Number(row.owner_id), appUserId: Number(row.app_user_id), name: row.name, currency: row.currency, createdAt: date(row.created_at), updatedAt: date(row.updated_at) };
 }
 function mapBudget(row: BudgetRow) {
   return { id: Number(row.id), companyId: Number(row.company_id), period: row.period, department: row.department, expenseCategory: row.expense_category, estimatedAmount: String(row.estimated_amount), notes: row.notes, createdAt: date(row.created_at), updatedAt: date(row.updated_at) };
@@ -68,15 +69,15 @@ function mapFollowUp(row: FollowUpRow) {
 
 export async function getOrCreateCompany(ownerId: number, ownerName?: string) {
   const client = supabase();
-  const existing = await client.from("companies").select("*").eq("owner_id", ownerId).limit(1);
+  const existing = await client.from("companies").select("*").eq("app_user_id", ownerId).limit(1);
   if (existing.error) throw existing.error;
   if (existing.data?.[0]) return mapCompany(existing.data[0] as CompanyRow);
-  const inserted = await client.from("companies").insert({ owner_id: ownerId, name: ownerName ? `${ownerName} Workspace` : "Company Workspace", currency: "SAR" }).select("*").single();
+  const inserted = await client.from("companies").insert({ owner_id: ownerId, app_user_id: ownerId, name: ownerName ? `${ownerName} Workspace` : "Company Workspace", currency: "SAR" }).select("*").single();
   if (inserted.error || !inserted.data) throw inserted.error ?? new Error("Could not create company workspace");
   return mapCompany(inserted.data as CompanyRow);
 }
 
-export async function getCompanySnapshot(companyId: number) {
+export async function getCompanySnapshot(companyId: number, filters: { search?: string; category?: string; dateFrom?: string; dateTo?: string } = {}) {
   const client = supabase();
   const [companyResult, budgetResult, expenseResult, followResult] = await Promise.all([
     client.from("companies").select("*").eq("id", companyId).limit(1),
@@ -87,8 +88,19 @@ export async function getCompanySnapshot(companyId: number) {
   for (const result of [companyResult, budgetResult, expenseResult, followResult]) if (result.error) throw result.error;
   const companyRow = companyResult.data?.[0] as CompanyRow | undefined;
   if (!companyRow) throw new Error("Company workspace was not found in Supabase");
-  const budgetRows = (budgetResult.data ?? []).map(row => mapBudget(row as BudgetRow));
-  const expenseRows = (expenseResult.data ?? []).map(row => mapExpense(row as ExpenseRow));
+  const rawBudgetRows = (budgetResult.data ?? []).map(row => mapBudget(row as BudgetRow));
+  const rawExpenseRows = (expenseResult.data ?? []).map(row => mapExpense(row as ExpenseRow));
+  const term = filters.search?.trim().toLowerCase();
+  const matches = (department: string, category: string, period: string, dateValue?: Date) => {
+    if (filters.category && category !== filters.category) return false;
+    if (term && !`${department} ${category}`.toLowerCase().includes(term)) return false;
+    const dateText = dateValue ? dateValue.toISOString().slice(0, 10) : `${period}-01`;
+    if (filters.dateFrom && dateText < filters.dateFrom) return false;
+    if (filters.dateTo && dateText > filters.dateTo) return false;
+    return true;
+  };
+  const budgetRows = rawBudgetRows.filter(row => matches(row.department, row.expenseCategory, row.period));
+  const expenseRows = rawExpenseRows.filter(row => matches(row.department, row.expenseCategory, row.period, row.expenseDate));
   const followRows = (followResult.data ?? []).map(row => mapFollowUp(row as FollowUpRow));
 
   const budgetMap = new Map<string, number>();
@@ -135,13 +147,13 @@ export async function getCompanySnapshot(companyId: number) {
 }
 
 export async function listBudgets(companyId: number) { const result = await supabase().from("budgets").select("*").eq("company_id", companyId).order("period", { ascending: false }); if (result.error) throw result.error; return (result.data ?? []).map(row => mapBudget(row as BudgetRow)); }
-export async function createBudget(companyId: number, input: { period:string; department:string; expenseCategory:string; estimatedAmount:number; notes?:string }) { const result = await supabase().from("budgets").insert({ company_id:companyId, period:input.period, department:input.department, expense_category:input.expenseCategory, estimated_amount:input.estimatedAmount.toFixed(2), notes:input.notes }); if (result.error) throw result.error; }
-export async function bulkCreateBudgets(companyId: number, rows: { period:string; department:string; expenseCategory:string; estimatedAmount:number; notes?:string }[]) { const result = await supabase().from("budgets").insert(rows.map(input => ({ company_id:companyId, period:input.period, department:input.department, expense_category:input.expenseCategory, estimated_amount:input.estimatedAmount.toFixed(2), notes:input.notes }))); if (result.error) throw result.error; }
+export async function createBudget(companyId: number, appUserId: number, userName: string, input: { period:string; department:string; expenseCategory:string; estimatedAmount:number; notes?:string }) { const result = await supabase().from("budgets").insert({ company_id:companyId, period:input.period, department:input.department, expense_category:input.expenseCategory, estimated_amount:input.estimatedAmount.toFixed(2), notes:input.notes }).select("id").single(); if (result.error) throw result.error; await recordAudit({ companyId, appUserId, userName, action:"CREATE", entityType:"budget", entityId:Number(result.data.id), summary:`تم إنشاء بند موازنة ${input.department} / ${input.expenseCategory}`, changes:input }); }
+export async function bulkCreateBudgets(companyId: number, appUserId: number, userName: string, rows: { period:string; department:string; expenseCategory:string; estimatedAmount:number; notes?:string }[]) { const result = await supabase().from("budgets").insert(rows.map(input => ({ company_id:companyId, period:input.period, department:input.department, expense_category:input.expenseCategory, estimated_amount:input.estimatedAmount.toFixed(2), notes:input.notes }))); if (result.error) throw result.error; await recordAudit({ companyId, appUserId, userName, action:"IMPORT", entityType:"budget", summary:`تم استيراد ${rows.length} بند موازنة`, changes:{ count: rows.length } }); }
 export async function listExpenses(companyId: number) { const result = await supabase().from("expenses").select("*").eq("company_id", companyId).order("expense_date", { ascending: false }); if (result.error) throw result.error; return (result.data ?? []).map(row => mapExpense(row as ExpenseRow)); }
-export async function createExpense(companyId: number, input: { transactionId:string; expenseDate:string; period:string; department:string; expenseCategory:string; description?:string; actualAmount:number; paymentMethod:string; supportingDocument:"Available"|"Pending Review" }) { const result = await supabase().from("expenses").insert({ company_id:companyId, transaction_id:input.transactionId, expense_date:input.expenseDate, period:input.period, department:input.department, expense_category:input.expenseCategory, description:input.description, actual_amount:input.actualAmount.toFixed(2), payment_method:input.paymentMethod, supporting_document:input.supportingDocument }); if (result.error) throw result.error; }
-export async function bulkCreateExpenses(companyId: number, rows: { transactionId:string; expenseDate:string; period:string; department:string; expenseCategory:string; description?:string; actualAmount:number; paymentMethod:string; supportingDocument:"Available"|"Pending Review" }[]) { const result = await supabase().from("expenses").insert(rows.map(input => ({ company_id:companyId, transaction_id:input.transactionId, expense_date:input.expenseDate, period:input.period, department:input.department, expense_category:input.expenseCategory, description:input.description, actual_amount:input.actualAmount.toFixed(2), payment_method:input.paymentMethod, supporting_document:input.supportingDocument }))); if (result.error) throw result.error; }
+export async function createExpense(companyId: number, appUserId: number, userName: string, input: { transactionId:string; expenseDate:string; period:string; department:string; expenseCategory:string; description?:string; actualAmount:number; paymentMethod:string; supportingDocument:"Available"|"Pending Review" }) { const result = await supabase().from("expenses").insert({ company_id:companyId, transaction_id:input.transactionId, expense_date:input.expenseDate, period:input.period, department:input.department, expense_category:input.expenseCategory, description:input.description, actual_amount:input.actualAmount.toFixed(2), payment_method:input.paymentMethod, supporting_document:input.supportingDocument }).select("id").single(); if (result.error) throw result.error; await recordAudit({ companyId, appUserId, userName, action:"CREATE", entityType:"expense", entityId:Number(result.data.id), summary:`تم تسجيل مصروف ${input.department} / ${input.expenseCategory}`, changes:input }); }
+export async function bulkCreateExpenses(companyId: number, appUserId: number, userName: string, rows: { transactionId:string; expenseDate:string; period:string; department:string; expenseCategory:string; description?:string; actualAmount:number; paymentMethod:string; supportingDocument:"Available"|"Pending Review" }[]) { const result = await supabase().from("expenses").insert(rows.map(input => ({ company_id:companyId, transaction_id:input.transactionId, expense_date:input.expenseDate, period:input.period, department:input.department, expense_category:input.expenseCategory, description:input.description, actual_amount:input.actualAmount.toFixed(2), payment_method:input.paymentMethod, supporting_document:input.supportingDocument }))); if (result.error) throw result.error; await recordAudit({ companyId, appUserId, userName, action:"IMPORT", entityType:"expense", summary:`تم استيراد ${rows.length} مصروف`, changes:{ count: rows.length } }); }
 export async function listFollowUps(companyId: number) { const result = await supabase().from("follow_ups").select("*").eq("company_id", companyId).order("created_at", { ascending: false }); if (result.error) throw result.error; return (result.data ?? []).map(row => mapFollowUp(row as FollowUpRow)); }
-export async function updateFollowUpStatus(companyId: number, id: number, status: "Open"|"In Progress"|"Closed") { const result = await supabase().from("follow_ups").update({ status }).eq("id", id).eq("company_id", companyId); if (result.error) throw result.error; }
+export async function updateFollowUpStatus(companyId: number, appUserId: number, userName: string, id: number, status: "Open"|"In Progress"|"Closed") { const result = await supabase().from("follow_ups").update({ status }).eq("id", id).eq("company_id", companyId); if (result.error) throw result.error; await recordAudit({ companyId, appUserId, userName, action:"UPDATE", entityType:"follow_up", entityId:id, summary:`تم تحديث حالة سجل المتابعة إلى ${status}`, changes:{ status } }); }
 
 export async function seedCompanyDemo(companyId: number) {
   const client = supabase();
